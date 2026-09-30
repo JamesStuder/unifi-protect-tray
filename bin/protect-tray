@@ -95,6 +95,18 @@ def local_ip(host):
     return "<this-computer-ip>"
 
 
+def set_clipboard(text):
+    """On Wayland an app without a focused window can't set the clipboard itself (a tray menu
+    doesn't count), so hand the text to the desktop's clipboard service when there is one."""
+    import shutil
+    for cmd in (["wl-copy", "--", text] if shutil.which("wl-copy") else None,
+                ["qdbus6", "org.kde.klipper", "/klipper", "org.kde.klipper.klipper.setClipboardContents", text]
+                if shutil.which("qdbus6") else None):
+        if cmd and subprocess.run(cmd, capture_output=True, timeout=5).returncode == 0:
+            return
+    QApplication.clipboard().setText(text)
+
+
 def webhook_url(c):
     addr = c.get("address") or local_ip(c["host"] or "1.1.1.1")
     return f"http://{addr}:{c['port']}/protect/{c['token']}"
@@ -221,7 +233,15 @@ class ProtectTray(QObject):
             do_PUT = do_POST
 
             def do_GET(self):
-                self.send_error(404 if self.path.split("?")[0] != path else 405)
+                # Alarm Manager's webhook defaults to GET, which carries no alarm details.
+                # Still notify (so a missed setting doesn't fail silently) and log a hint.
+                if self.path.split("?")[0] != path:
+                    self.send_error(404)
+                    return
+                self.send_response(200)
+                self.end_headers()
+                log("webhook came as GET: set the alarm's webhook method to POST for names and thumbnails")
+                hook.alarm.emit({"alarm": {"name": "Protect alarm"}, "via_get": True})
 
             def log_message(self, fmt, *a):
                 log("http", self.client_address[0], (fmt % a).replace(path, "/protect/<token>"))
@@ -405,7 +425,7 @@ class ProtectTray(QObject):
         self.update_tooltip()
 
     def copy_webhook(self):
-        QApplication.clipboard().setText(self.webhook_url())
+        set_clipboard(self.webhook_url())
         self.notify_simple("Webhook URL copied", "Paste it into the alarm's Custom Webhook action (POST).", "edit-copy")
 
     def set_dnd(self, secs):

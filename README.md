@@ -101,6 +101,8 @@ afterwards). `protect-tray url` prints the webhook URL.
   shows up when the alarm fires, the console can't reach this computer: check the
   firewall rule and that the webhook URL still has this computer's current IP.
 - **"API key rejected":** create a new key and enter it under Settings → API key.
+- **Notification says only "Protect alarm":** the webhook is set to GET (the default).
+  Set its method to **POST** under Advanced to get the alarm name and thumbnail.
 
 ## Uninstall
 
