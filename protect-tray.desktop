@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=UniFi Protect tray
+Comment=UniFi Protect alarms as desktop notifications
+Exec=protect-tray
+Icon=camera-web
+Categories=Network;Security;
+NoDisplay=true

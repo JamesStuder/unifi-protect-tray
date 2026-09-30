@@ -1,0 +1,12 @@
+[Unit]
+Description=UniFi Protect tray: Alarm Manager webhooks as desktop notifications
+After=graphical-session.target network-online.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/protect-tray
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

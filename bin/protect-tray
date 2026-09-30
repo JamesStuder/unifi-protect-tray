@@ -1,0 +1,431 @@
+#!/usr/bin/env python3
+"""UniFi Protect alarms as desktop notifications, plus a camera list in the system tray.
+
+What you get notified about is set up only in UniFi Protect: Alarm Manager -> Create Alarm,
+with a "Custom Webhook" action (POST, "Use Thumbnails" on) pointing at the URL from the
+tray menu ("Copy webhook URL"). This app shows whatever Protect sends and filters nothing.
+
+  webhook listener   http://<this computer>:<port>/protect/<token>
+  GET  {console}/proxy/protect/integration/v1/cameras               camera names + tray menu
+  GET  {console}/proxy/protect/integration/v1/cameras/<id>/snapshot fallback image
+
+Settings: ~/.config/protect-tray/config.json (console address, port, token)
+API key:  ~/.config/protect-tray/api-key (mode 0600)
+Both can be changed from the tray menu (Settings).
+
+Usage: protect-tray            run the tray app
+       protect-tray url        print the webhook URL
+"""
+import base64, json, os, secrets, subprocess, sys, threading, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+from PyQt6.QtCore import QObject, QProcess, QTimer, QUrl, pyqtSignal
+from PyQt6.QtGui import QIcon
+from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest, QSslConfiguration, QSslSocket
+from PyQt6.QtWidgets import QApplication, QInputDialog, QLineEdit, QMenu, QMessageBox, QSystemTrayIcon
+
+CONF_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "protect-tray"
+KEY_FILE = CONF_DIR / "api-key"
+CONF_FILE = CONF_DIR / "config.json"
+SNAP_DIR = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "protect-tray"
+DEFAULT_PORT = 8765
+
+LABEL = {"ring": "Doorbell ring", "person": "Person", "vehicle": "Vehicle", "animal": "Animal",
+         "package": "Package", "motion": "Motion", "face": "Face", "licensePlate": "License plate",
+         "line_crossing": "Line crossed", "loitering": "Loitering"}
+
+
+def log(*a):
+    print(time.strftime("%H:%M:%S"), *a, flush=True)
+
+
+def load_conf():
+    try:
+        c = json.loads(CONF_FILE.read_text())
+    except (OSError, ValueError):
+        c = {}
+    c.setdefault("host", "")
+    c.setdefault("port", DEFAULT_PORT)
+    c.setdefault("address", "")     # this computer's address for the webhook URL; empty = detect
+    c.setdefault("dnd_until", 0)
+    if not c.get("token"):
+        c["token"] = secrets.token_urlsafe(18)
+    save_conf(c)
+    return c
+
+
+def save_conf(c):
+    CONF_DIR.mkdir(parents=True, exist_ok=True)
+    CONF_DIR.chmod(0o700)
+    CONF_FILE.write_text(json.dumps(c, indent=2))
+    CONF_FILE.chmod(0o600)
+
+
+def read_key():
+    try:
+        return KEY_FILE.read_text().strip()
+    except OSError:
+        return ""
+
+
+def write_key(key):
+    CONF_DIR.mkdir(parents=True, exist_ok=True)
+    fd = os.open(KEY_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(key.strip())
+
+
+def ssl_config():
+    # UniFi consoles use a self-signed certificate. Requests only go to the configured console.
+    cfg = QSslConfiguration.defaultConfiguration()
+    cfg.setPeerVerifyMode(QSslSocket.PeerVerifyMode.VerifyNone)
+    return cfg
+
+
+def local_ip(host):
+    """The address of this computer that the console can reach (source address of the route to it)."""
+    try:
+        out = subprocess.run(["ip", "-4", "route", "get", host], capture_output=True, text=True, timeout=3).stdout
+        parts = out.split()
+        if "src" in parts:
+            return parts[parts.index("src") + 1]
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return "<this-computer-ip>"
+
+
+def webhook_url(c):
+    addr = c.get("address") or local_ip(c["host"] or "1.1.1.1")
+    return f"http://{addr}:{c['port']}/protect/{c['token']}"
+
+
+class Hook(QObject):
+    alarm = pyqtSignal(dict)
+
+
+class ProtectTray(QObject):
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+        self.conf = load_conf()
+        self.key = read_key()
+        self.cameras = {}   # id -> {"name", "state", "mac"}
+        self.by_mac = {}    # MAC without separators, upper case -> id
+        self.procs = set()
+        self.last = None
+        self.status = "not set up"
+        SNAP_DIR.mkdir(parents=True, exist_ok=True)
+
+        self.net = QNetworkAccessManager(self)
+        self.tray = QSystemTrayIcon(QIcon.fromTheme("camera-web"), self)
+        self.tray.activated.connect(self.on_click)
+        self.menu = QMenu()
+        self.tray.setContextMenu(self.menu)
+        self.build_menu()
+        self.tray.show()
+
+        self.hook = Hook()
+        self.hook.alarm.connect(self.on_alarm)
+        self.server = None
+        self.start_server()
+        QTimer(self, interval=15 * 60 * 1000, timeout=self.load_cameras).start()
+        if not self.conf["host"] or not self.key:
+            QTimer.singleShot(500, self.first_run)
+        else:
+            self.load_cameras()
+
+    # ---- helpers ----
+    @property
+    def api(self):
+        return f"https://{self.conf['host']}/proxy/protect/integration/v1"
+
+    @property
+    def web(self):
+        return f"https://{self.conf['host']}/protect"
+
+    def webhook_url(self):
+        return webhook_url(self.conf)
+
+    # ---- setup / settings ----
+    def first_run(self):
+        QMessageBox.information(None, "UniFi Protect tray",
+                                "Set up the connection to your UniFi console.\n\n"
+                                "You need its address (for example 192.168.1.1) and an API key "
+                                "(create one in the console under Integrations).")
+        if self.ask_host() and self.ask_key():
+            self.load_cameras()
+
+    def ask_host(self):
+        host, ok = QInputDialog.getText(None, "UniFi Protect tray", "Console address (IP or host name):",
+                                        QLineEdit.EchoMode.Normal, self.conf["host"])
+        host = host.strip().removeprefix("https://").removeprefix("http://").strip("/")
+        if not ok or not host:
+            return False
+        self.conf["host"] = host
+        save_conf(self.conf)
+        return True
+
+    def ask_key(self):
+        key, ok = QInputDialog.getText(None, "UniFi Protect tray",
+                                       "API key (leave empty to keep the current one):" if self.key else "API key:",
+                                       QLineEdit.EchoMode.Password)
+        key = key.strip()
+        if not ok or (not key and not self.key):
+            return False
+        if key:
+            write_key(key)
+            self.key = key
+        return True
+
+    def change_address(self):
+        addr, ok = QInputDialog.getText(
+            None, "UniFi Protect tray",
+            "This computer's address in the webhook URL.\n"
+            "Leave empty to detect it (the address used to reach the console).\n"
+            "Set a fixed one if you switch between Wi-Fi and Ethernet.",
+            QLineEdit.EchoMode.Normal, self.conf.get("address", ""))
+        if ok:
+            self.conf["address"] = addr.strip()
+            save_conf(self.conf)
+            self.build_menu()
+            self.notify_simple("Webhook URL", self.webhook_url().rsplit("/", 1)[0] + "/…\n"
+                               "Copy it again and update your alarms if it changed.")
+
+    def change_host(self):
+        if self.ask_host():
+            self.load_cameras(announce=True)
+
+    def change_key(self):
+        if self.ask_key():
+            self.load_cameras(announce=True)
+
+    # ---- webhook listener ----
+    def start_server(self):
+        hook, path = self.hook, f"/protect/{self.conf['token']}"
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                if self.path.split("?")[0] != path:
+                    self.send_error(404)
+                    return
+                n = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(min(n, 10 << 20))
+                self.send_response(200)
+                self.end_headers()
+                try:
+                    hook.alarm.emit(json.loads(body or b"{}"))
+                except ValueError:
+                    log("webhook: body is not JSON")
+
+            do_PUT = do_POST
+
+            def do_GET(self):
+                self.send_error(404 if self.path.split("?")[0] != path else 405)
+
+            def log_message(self, fmt, *a):
+                log("http", self.client_address[0], (fmt % a).replace(path, "/protect/<token>"))
+
+        try:
+            self.server = ThreadingHTTPServer(("0.0.0.0", int(self.conf["port"])), Handler)
+        except OSError as e:
+            log(f"cannot listen on port {self.conf['port']}: {e}")
+            self.status = f"port {self.conf['port']} unavailable"
+            return
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        log(f"listening on :{self.conf['port']}")
+
+    # ---- REST ----
+    def request(self, path):
+        req = QNetworkRequest(QUrl(self.api + path))
+        req.setRawHeader(b"X-API-KEY", self.key.encode())
+        req.setSslConfiguration(ssl_config())
+        req.setTransferTimeout(15000)
+        return self.net.get(req)
+
+    def load_cameras(self, announce=False):
+        if not self.conf["host"] or not self.key:
+            return
+        reply = self.request("/cameras")
+
+        def done():
+            code = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
+            if reply.error() == QNetworkReply.NetworkError.NoError:
+                try:
+                    cams = json.loads(bytes(reply.readAll()))
+                    self.cameras = {c["id"]: {"name": c.get("name") or c["id"], "state": c.get("state"),
+                                              "mac": (c.get("mac") or "").replace(":", "").upper()} for c in cams}
+                    self.by_mac = {c["mac"]: cid for cid, c in self.cameras.items() if c["mac"]}
+                    self.status = f"connected, {len(self.cameras)} cameras"
+                except (ValueError, KeyError, TypeError):
+                    self.status = "unexpected answer from the console"
+            elif code == 401:
+                self.status = "API key rejected"
+            else:
+                self.status = f"console unreachable ({reply.errorString()})"
+            log("cameras:", self.status)
+            if announce:
+                self.notify_simple("UniFi Protect", self.status.capitalize())
+            self.build_menu()
+            reply.deleteLater()
+        reply.finished.connect(done)
+
+    def camera_of(self, device):
+        d = (device or "").replace(":", "").upper()
+        return self.by_mac.get(d) or (device if device in self.cameras else None)
+
+    # ---- alarms ----
+    def on_alarm(self, payload):
+        alarm = payload.get("alarm") or {}
+        dbg = json.loads(json.dumps(payload))
+        (dbg.get("alarm") or {}).pop("thumbnail", None)
+        log("alarm", json.dumps(dbg)[:800])
+        triggers = alarm.get("triggers") or [{}]
+        if time.time() < self.conf.get("dnd_until", 0) and "ring" not in {t.get("key") for t in triggers}:
+            return      # do-not-disturb still lets the doorbell through
+        key = triggers[0].get("key") or ""
+        cam = self.camera_of(triggers[0].get("device") or
+                             next((s.get("device") for s in alarm.get("sources") or []), ""))
+        cam_name = self.cameras.get(cam, {}).get("name", "")
+        kinds = []
+        for t in triggers:
+            k = LABEL.get(t.get("key"), (t.get("key") or "").replace("_", " ").title())
+            if k and k not in kinds:
+                kinds.append(k)
+        title = alarm.get("name") or LABEL.get(key) or "UniFi Protect"
+        if cam_name and cam_name.lower() not in title.lower():
+            title += f" · {cam_name}"
+        body = (", ".join(kinds) or "Alarm") + f" at {time.strftime('%-I:%M %p')}"
+        path = alarm.get("eventPath") or payload.get("eventPath") or ""
+        if path.startswith("/"):
+            url = f"https://{self.conf['host']}{path}"
+        else:
+            url = path or (self.camera_url(cam) if cam else f"{self.web}/dashboard")
+        self.last = f"{title} ({time.strftime('%-I:%M %p')})"
+        self.update_tooltip()
+
+        thumb = alarm.get("thumbnail") or ""
+        if thumb:
+            try:
+                snap = SNAP_DIR / f"alarm-{int(time.time() * 1000)}.jpg"
+                snap.write_bytes(base64.b64decode(thumb.split(",", 1)[-1]))
+                self.show(title, body, str(snap), key, url)
+                return
+            except ValueError:
+                pass
+        if not cam:
+            self.show(title, body, "camera-web", key, url)
+            return
+        reply = self.request(f"/cameras/{cam}/snapshot")
+
+        def got():
+            icon = "camera-web"
+            if reply.error() == QNetworkReply.NetworkError.NoError:
+                snap = SNAP_DIR / f"{cam}.jpg"
+                snap.write_bytes(bytes(reply.readAll()))
+                icon = str(snap)
+            reply.deleteLater()
+            self.show(title, body, icon, key, url)
+        reply.finished.connect(got)
+
+    def show(self, title, body, icon, key, url):
+        args = ["-a", "UniFi Protect", "-i", icon, "-A", "view=View",
+                "-u", "critical" if key == "ring" else "normal", title, body]
+        p = QProcess(self)
+        p.finished.connect(lambda *a, p=p: self.on_action(p, url))
+        self.procs.add(p)
+        p.start("notify-send", args)
+        for old in sorted(SNAP_DIR.glob("alarm-*.jpg"))[:-20]:
+            old.unlink(missing_ok=True)
+
+    def notify_simple(self, title, body, icon="camera-web"):
+        QProcess.startDetached("notify-send", ["-a", "UniFi Protect", "-i", icon, title, body])
+
+    def on_action(self, proc, url):
+        choice = bytes(proc.readAllStandardOutput()).decode().strip()
+        self.procs.discard(proc)
+        proc.deleteLater()
+        if choice == "view":
+            self.open_url(url)
+
+    # ---- tray ----
+    def open_url(self, url):
+        QProcess.startDetached("xdg-open", [url])
+
+    def camera_url(self, cam):
+        return f"{self.web}/devices/{cam}"
+
+    def on_click(self, reason):
+        if reason == QSystemTrayIcon.ActivationReason.Trigger and self.conf["host"]:
+            self.open_url(f"{self.web}/dashboard")
+
+    def update_tooltip(self):
+        tip = "UniFi Protect: " + self.status
+        if time.time() < self.conf.get("dnd_until", 0):
+            tip += "\nDo not disturb is on"
+        if self.last:
+            tip += f"\nLast alarm: {self.last}"
+        self.tray.setToolTip(tip)
+
+    def build_menu(self):
+        m = self.menu
+        m.clear()
+        cams = sorted(((c["name"], cid) for cid, c in self.cameras.items() if c.get("state") == "CONNECTED"),
+                      key=lambda x: x[0].lower())
+        if cams:
+            for name, cid in cams:
+                m.addAction(QIcon.fromTheme("camera-web"), name).triggered.connect(
+                    lambda _=False, cid=cid: self.open_url(self.camera_url(cid)))
+        else:
+            m.addAction(self.status.capitalize()).setEnabled(False)
+        m.addSeparator()
+        d = m.addMenu("Do not disturb")
+        on = time.time() < self.conf.get("dnd_until", 0)
+        for label, secs in (("Off", 0), ("1 hour", 3600), ("4 hours", 4 * 3600), ("Until turned off", 10 * 365 * 86400)):
+            a = d.addAction(label)
+            a.setCheckable(True)
+            a.setChecked(not on if secs == 0 else False)
+            a.triggered.connect(lambda _=False, s=secs: self.set_dnd(s))
+        d.addSeparator()
+        d.addAction("The doorbell always comes through").setEnabled(False)
+        m.addSeparator()
+        m.addAction(QIcon.fromTheme("edit-copy"), "Copy webhook URL (for Alarm Manager)").triggered.connect(
+            self.copy_webhook)
+        m.addAction(QIcon.fromTheme("internet-web-browser"), "Open Alarm Manager").triggered.connect(
+            lambda: self.open_url(f"{self.web}/alarm-manager"))
+        m.addAction(QIcon.fromTheme("internet-web-browser"), "Open Protect").triggered.connect(
+            lambda: self.open_url(f"{self.web}/dashboard"))
+        s = m.addMenu(QIcon.fromTheme("configure"), "Settings")
+        s.addAction(f"Console address… ({self.conf['host'] or 'not set'})").triggered.connect(self.change_host)
+        s.addAction("API key…" + ("" if self.key else " (not set)")).triggered.connect(self.change_key)
+        s.addAction(f"This computer's address… ({self.conf.get('address') or 'auto'})").triggered.connect(
+            self.change_address)
+        s.addAction("Test connection").triggered.connect(lambda: self.load_cameras(announce=True))
+        m.addAction(QIcon.fromTheme("application-exit"), "Quit").triggered.connect(self.app.quit)
+        self.update_tooltip()
+
+    def copy_webhook(self):
+        QApplication.clipboard().setText(self.webhook_url())
+        self.notify_simple("Webhook URL copied", "Paste it into the alarm's Custom Webhook action (POST).", "edit-copy")
+
+    def set_dnd(self, secs):
+        self.conf["dnd_until"] = time.time() + secs if secs else 0
+        save_conf(self.conf)
+        self.build_menu()
+
+
+def main():
+    if sys.argv[1:] == ["url"]:
+        c = load_conf()
+        print(webhook_url(c))
+        return
+    app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
+    app.setApplicationName("protect-tray")
+    app.setDesktopFileName("protect-tray")
+    ProtectTray(app)
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
